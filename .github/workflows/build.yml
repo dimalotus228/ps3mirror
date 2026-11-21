@@ -329,8 +329,14 @@ jobs:
           #include <string.h>
           #include <stdint.h>
           #include <malloc.h>
-          #include <unistd.h>⁴
-          #include <sysutil/sysutil.h>
+          #include <unistd.h>
+                    #if defined(__has_include)
+          #  if __has_include(<sysutil/sysutil.h>)
+          #    include <sysutil/sysutil.h>
+          #  elif __has_include(<sys/sysutil.h>)
+          #    include <sys/sysutil.h>
+          #  endif
+          #endif
           #include <sysutil/video.h>
           #include <rsx/rsx.h>
           #include <net/net.h>
