@@ -1,0 +1,555 @@
+name: Build PS3 Mirror
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname 'ps3mirror-android/settings.gradle')"
+          cat > 'ps3mirror-android/settings.gradle' << 'EOF_A0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ps3mirror"
+          include(":app")
+          EOF_A0
+          mkdir -p "$(dirname 'ps3mirror-android/build.gradle')"
+          cat > 'ps3mirror-android/build.gradle' << 'EOF_A1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF_A1
+          mkdir -p "$(dirname 'ps3mirror-android/gradle.properties')"
+          cat > 'ps3mirror-android/gradle.properties' << 'EOF_A2'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_A2
+          mkdir -p "$(dirname 'ps3mirror-android/app/build.gradle')"
+          cat > 'ps3mirror-android/app/build.gradle' << 'EOF_A3'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.example.ps3mirror'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.ps3mirror'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF_A3
+          mkdir -p "$(dirname 'ps3mirror-android/app/src/main/AndroidManifest.xml')"
+          cat > 'ps3mirror-android/app/src/main/AndroidManifest.xml' << 'EOF_A4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="PS3 Mirror"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".StreamService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_A4
+          mkdir -p "$(dirname 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/MainActivity.kt')"
+          cat > 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/MainActivity.kt' << 'EOF_A5'
+          package com.example.ps3mirror
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+
+          class MainActivity : Activity() {
+              private lateinit var ipEdit: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("p", 0)
+
+                  ipEdit = EditText(this).apply {
+                      hint = "IP вашей PS3, например 192.168.1.50"
+                      setText(prefs.getString("ip", ""))
+                  }
+                  val start = Button(this).apply {
+                      text = "Начать трансляцию"
+                      setOnClickListener {
+                          prefs.edit().putString("ip", ipEdit.text.toString().trim()).apply()
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          startActivityForResult(mpm.createScreenCaptureIntent(), 1)
+                      }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Остановить"
+                      setOnClickListener { stopService(Intent(this@MainActivity, StreamService::class.java)) }
+                  }
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      addView(ipEdit); addView(start); addView(stop)
+                  }
+                  setContentView(layout)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, StreamService::class.java)
+                          .putExtra("code", resultCode)
+                          .putExtra("data", data)
+                          .putExtra("ip", ipEdit.text.toString().trim())
+                      startForegroundService(i)
+                  }
+              }
+          }
+          EOF_A5
+          mkdir -p "$(dirname 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/StreamService.kt')"
+          cat > 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/StreamService.kt' << 'EOF_A6'
+          package com.example.ps3mirror
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import java.io.BufferedOutputStream
+          import java.io.ByteArrayOutputStream
+          import java.io.DataOutputStream
+          import java.io.IOException
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import kotlin.math.max
+
+          class StreamService : Service() {
+              // Настройки качества
+              private val longSide = 960      // длинная сторона кадра, пикселей
+              private val jpegQuality = 60
+              private val minIntervalMs = 66L // ~15 кадров/с
+
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var thread: HandlerThread? = null
+              private var socket: Socket? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null) { stopSelf(); return START_NOT_STICKY }
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("mirror", "Трансляция", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "mirror")
+                      .setContentTitle("Трансляция экрана на PS3")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+
+                  val code = intent.getIntExtra("code", 0)
+                  @Suppress("DEPRECATION")
+                  val data = intent.getParcelableExtra<Intent>("data")
+                  val ip = intent.getStringExtra("ip") ?: ""
+                  if (data == null || ip.isEmpty()) { stopSelf(); return START_NOT_STICKY }
+
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  projection = mpm.getMediaProjection(code, data).also {
+                      it.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { stopSelf() }
+                      }, null)
+                  }
+                  startStreaming(ip)
+                  return START_NOT_STICKY
+              }
+
+              private fun startStreaming(ip: String) {
+                  val dm = resources.displayMetrics
+                  val scale = longSide.toFloat() / max(dm.widthPixels, dm.heightPixels)
+                  val w = (dm.widthPixels * scale).toInt() / 2 * 2
+                  val h = (dm.heightPixels * scale).toInt() / 2 * 2
+
+                  val t = HandlerThread("capture").also { it.start() }
+                  thread = t
+                  val handler = Handler(t.looper)
+
+                  handler.post {
+                      try {
+                          val s = Socket()
+                          s.connect(InetSocketAddress(ip, 5000), 5000)
+                          s.tcpNoDelay = true
+                          socket = s
+                          val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 65536))
+
+                          val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                          reader = r
+                          val bmp = Bitmap.createBitmap(w + 64, h, Bitmap.Config.ARGB_8888)
+                          val baos = ByteArrayOutputStream(256 * 1024)
+                          var last = 0L
+
+                          r.setOnImageAvailableListener({ rd ->
+                              val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
+                              try {
+                                  val now = SystemClock.uptimeMillis()
+                                  if (now - last < minIntervalMs) return@setOnImageAvailableListener
+                                  last = now
+
+                                  val plane = img.planes[0]
+                                  val rowPixels = plane.rowStride / plane.pixelStride
+                                  val b = if (rowPixels == bmp.width) bmp
+                                          else Bitmap.createBitmap(rowPixels, h, Bitmap.Config.ARGB_8888)
+                                  b.copyPixelsFromBuffer(plane.buffer)
+                                  val cropped = Bitmap.createBitmap(b, 0, 0, w, h)
+
+                                  baos.reset()
+                                  cropped.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+                                  out.writeInt(baos.size())
+                                  baos.writeTo(out)
+                                  out.flush()
+                              } catch (e: IOException) {
+                                  stopSelf()
+                              } finally {
+                                  img.close()
+                              }
+                          }, handler)
+
+                          display = projection?.createVirtualDisplay(
+                              "ps3mirror", w, h, dm.densityDpi,
+                              DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                              r.surface, null, handler
+                          )
+                      } catch (e: Exception) {
+                          stopSelf()
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  try { display?.release() } catch (_: Exception) {}
+                  try { reader?.close() } catch (_: Exception) {}
+                  try { socket?.close() } catch (_: Exception) {}
+                  try { projection?.stop() } catch (_: Exception) {}
+                  thread?.quitSafely()
+                  super.onDestroy()
+              }
+          }
+          EOF_A6
+      - name: Build APK
+        run: |
+          cd ps3mirror-android
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PS3Mirror-Android-APK
+          path: ps3mirror-android/app/build/outputs/apk/debug/*.apk
+
+  ps3:
+    name: PS3 PKG
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      PS3DEV: /home/runner/ps3dev
+      PSL1GHT: /home/runner/ps3dev
+    steps:
+      - name: Cache toolchain
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/ps3dev
+          key: ps3dev-toolchain-v1
+      - name: Install build dependencies
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison flex gcc libelf-dev make texinfo libncurses5-dev patch python-is-python3 subversion wget zlib1g-dev libtool-bin python-dev-is-python3 bzip2 libgmp3-dev pkg-config g++ git libssl-dev
+      - name: Build PS3 toolchain (first run takes 1-2 hours)
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git
+          cd ps3toolchain
+          ./toolchain.sh
+      - name: Add toolchain to PATH
+        run: |
+          echo "/home/runner/ps3dev/bin" >> $GITHUB_PATH
+          echo "/home/runner/ps3dev/ppu/bin" >> $GITHUB_PATH
+          echo "/home/runner/ps3dev/spu/bin" >> $GITHUB_PATH
+      - name: Create PS3 project
+        run: |
+          mkdir -p "$(dirname 'ps3/source/main.c')"
+          cat > 'ps3/source/main.c' << 'EOF_P0'
+          // PS3 Screen Mirror - приёмник. Слушает TCP :5000, принимает JPEG-кадры
+          // формата [4 байта длина, big-endian][JPEG] и выводит на экран.
+          // Нужен stb_image.h рядом (https://github.com/nothings/stb)
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <malloc.h>
+          #include <unistd.h>
+          #include <sys/process.h>
+          #include <sysutil/sysutil.h>
+          #include <sysutil/video.h>
+          #include <rsx/rsx.h>
+          #include <net/net.h>
+          #include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <arpa/inet.h>
+
+          #define STB_IMAGE_IMPLEMENTATION
+          #define STBI_ONLY_JPEG
+          #define STBI_NO_STDIO
+          #define STBI_NO_HDR
+          #define STBI_NO_LINEAR
+          #include "stb_image.h"
+
+          #define PORT 5000
+          #define MAX_FRAME (2*1024*1024)
+
+          static gcmContextData *ctx;
+          static uint32_t W, H;
+          static uint32_t *fb[2];
+          static uint32_t offs[2];
+          static int cur = 0, first_flip = 1;
+          static volatile int running = 1;
+          static int lw = 0, lh = 0;
+
+          static void sys_cb(u64 status, u64 param, void *ud) {
+              if (status == SYSUTIL_EXIT_GAME) running = 0;
+          }
+
+          static void init_video(void) {
+              void *host = memalign(1024 * 1024, 1024 * 1024);
+              rsxInit(&ctx, 0x10000, 1024 * 1024, host);
+
+              videoState st;
+              videoGetState(0, 0, &st);
+              videoResolution res;
+              videoGetResolution(st.displayMode.resolution, &res);
+
+              videoConfiguration vc;
+              memset(&vc, 0, sizeof(vc));
+              vc.resolution = st.displayMode.resolution;
+              vc.format = VIDEO_BUFFER_FORMAT_XRGB;
+              vc.pitch = res.width * 4;
+              videoConfigure(0, &vc, NULL, 0);
+              videoGetState(0, 0, &st);
+
+              gcmSetFlipMode(GCM_FLIP_VSYNC);
+              W = res.width;
+              H = res.height;
+              for (int i = 0; i < 2; i++) {
+                  fb[i] = (uint32_t *)rsxMemalign(64, W * H * 4);
+                  rsxAddressToOffset(fb[i], &offs[i]);
+                  gcmSetDisplayBuffer(i, offs[i], W * 4, W, H);
+              }
+              gcmResetFlipStatus();
+          }
+
+          static void flip(void) {
+              if (!first_flip) {
+                  while (gcmGetFlipStatus() != 0) usleep(200);
+              }
+              first_flip = 0;
+              gcmResetFlipStatus();
+              gcmSetFlip(ctx, cur);
+              rsxFlushBuffer(ctx);
+              gcmSetWaitFlip(ctx);
+              cur ^= 1;
+          }
+
+          static void fill(uint32_t color) {
+              for (int b = 0; b < 2; b++)
+                  for (uint32_t i = 0; i < W * H; i++) fb[b][i] = color;
+          }
+
+          static void draw(const uint8_t *rgba, int w, int h) {
+              if (w != lw || h != lh) { fill(0); lw = w; lh = h; }
+              uint32_t dw = W, dh = (uint64_t)W * h / w;
+              if (dh > H) { dh = H; dw = (uint64_t)H * w / h; }
+              uint32_t ox = (W - dw) / 2, oy = (H - dh) / 2;
+              static int xmap[4096];
+              if (dw > 4096) return;
+              for (uint32_t x = 0; x < dw; x++) xmap[x] = (int)((uint64_t)x * w / dw);
+              for (uint32_t y = 0; y < dh; y++) {
+                  const uint8_t *row = rgba + (size_t)((uint64_t)y * h / dh) * w * 4;
+                  uint32_t *dst = fb[cur] + (size_t)(oy + y) * W + ox;
+                  for (uint32_t x = 0; x < dw; x++) {
+                      const uint8_t *p = row + xmap[x] * 4;
+                      dst[x] = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+                  }
+              }
+          }
+
+          // 1 = прочитано, 0 = тишина (таймаут), -1 = обрыв
+          static int recv_all(int s, uint8_t *p, size_t n, int allow_idle) {
+              size_t got = 0; int fails = 0;
+              while (got < n) {
+                  if (!running) return -1;
+                  int r = recv(s, p + got, n - got, 0);
+                  if (r > 0) { got += r; fails = 0; continue; }
+                  if (r == 0) return -1;
+                  sysUtilCheckCallback();
+                  if (allow_idle && got == 0) return 0;
+                  if (++fails > 10) return -1;
+              }
+              return 1;
+          }
+
+          int main(void) {
+              sysUtilRegisterCallback(0, sys_cb, NULL);
+              init_video();
+              fill(0x00202020);
+              flip();
+
+              netInitialize();
+              int ls = socket(AF_INET, SOCK_STREAM, 0);
+              int one = 1;
+              setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+              struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+              setsockopt(ls, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons(PORT);
+              addr.sin_addr.s_addr = htonl(INADDR_ANY);
+              bind(ls, (struct sockaddr *)&addr, sizeof(addr));
+              listen(ls, 1);
+
+              uint8_t *buf = (uint8_t *)malloc(MAX_FRAME);
+
+              while (running) {
+                  sysUtilCheckCallback();
+                  int c = accept(ls, NULL, NULL);
+                  if (c < 0) continue;
+                  setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+                  while (running) {
+                      uint8_t hdr[4];
+                      int rc = recv_all(c, hdr, 4, 1);
+                      if (rc == 0) continue;
+                      if (rc < 0) break;
+                      uint32_t len = ((uint32_t)hdr[0] << 24) | (hdr[1] << 16) | (hdr[2] << 8) | hdr[3];
+                      if (len == 0) continue;
+                      if (len > MAX_FRAME) break;
+                      if (recv_all(c, buf, len, 0) <= 0) break;
+
+                      int w, h, n;
+                      uint8_t *img = stbi_load_from_memory(buf, (int)len, &w, &h, &n, 4);
+                      if (!img) continue;
+                      draw(img, w, h);
+                      free(img);
+                      flip();
+                      sysUtilCheckCallback();
+                  }
+                  close(c);
+                  fill(0x00202020);
+                  flip();
+              }
+
+              close(ls);
+              free(buf);
+              netDeinitialize();
+              return 0;
+          }
+          EOF_P0
+          mkdir -p "$(dirname 'ps3/Makefile')"
+          cat > 'ps3/Makefile' << 'EOF_P1'
+          .SUFFIXES:
+          ifeq ($(strip $(PSL1GHT)),)
+          $(error "Please set PSL1GHT")
+          endif
+          include $(PSL1GHT)/ppu_rules
+
+          TARGET   := ps3mirror
+          BUILD    := build
+          SOURCE   := source
+          INCLUDE  := source
+          DATA     := data
+          LIBS     := -lrsx -lgcm_sys -lio -lsysutil -lrt -llv2 -lnet -lm
+
+          TITLE    := PS3 Screen Mirror
+          APPID    := MIRROR001
+          CONTENTID := UP0001-$(APPID)_00-0000000000000000
+
+          CFLAGS   = -O2 -Wall -mcpu=cell $(MACHDEP) $(INCLUDES)
+          CXXFLAGS = $(CFLAGS)
+          LDFLAGS  = $(MACHDEP) -Wl,-Map,$(notdir $@).map
+
+          ifneq ($(BUILD),$(notdir $(CURDIR)))
+          export OUTPUT   := $(CURDIR)/$(TARGET)
+          export VPATH    := $(foreach dir,$(SOURCE),$(CURDIR)/$(dir))
+          export BUILDDIR := $(CURDIR)/$(BUILD)
+          export DEPSDIR  := $(BUILDDIR)
+          CFILES  := $(foreach dir,$(SOURCE),$(notdir $(wildcard $(dir)/*.c)))
+          export OFILES   := $(CFILES:.c=.o)
+          export INCLUDES := $(foreach dir,$(INCLUDE),-I$(CURDIR)/$(dir)) -I$(CURDIR)/$(BUILD)
+
+          .PHONY: $(BUILD) clean pkg
+          $(BUILD):
+          	@[ -d $@ ] || mkdir -p $@
+          	@make --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+          clean:
+          	@rm -rf $(BUILD) $(OUTPUT).elf $(OUTPUT).self $(OUTPUT)*.pkg
+          pkg: $(BUILD) $(OUTPUT).pkg
+          else
+          DEPENDS := $(OFILES:.o=.d)
+          $(OUTPUT).self: $(OUTPUT).elf
+          $(OUTPUT).elf: $(OFILES)
+          -include $(DEPENDS)
+          endif
+          EOF_P1
+          wget -O ps3/source/stb_image.h https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+      - name: Build PKG
+        run: |
+          cd ps3
+          make pkg
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PS3Mirror-PKG
+          path: ps3/*.pkg
