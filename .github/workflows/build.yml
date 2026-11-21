@@ -329,8 +329,7 @@ jobs:
           #include <string.h>
           #include <stdint.h>
           #include <malloc.h>
-          #include <unistd.h>
-          #include <sys/process.h>
+          #include <unistd.h>⁴
           #include <sysutil/sysutil.h>
           #include <sysutil/video.h>
           #include <rsx/rsx.h>
