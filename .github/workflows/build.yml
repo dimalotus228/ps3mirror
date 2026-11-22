@@ -156,6 +156,8 @@ jobs:
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
           import android.os.*
+          import android.util.DisplayMetrics
+          import android.view.Display
           import java.io.BufferedOutputStream
           import java.io.ByteArrayOutputStream
           import java.io.DataOutputStream
@@ -174,7 +176,17 @@ jobs:
               private var display: VirtualDisplay? = null
               private var reader: ImageReader? = null
               private var thread: HandlerThread? = null
+              private var handler: Handler? = null
               private var socket: Socket? = null
+              private var out: DataOutputStream? = null
+              private var listener: DisplayManager.DisplayListener? = null
+
+              private var curW = 0
+              private var curH = 0
+              private var dpi = 320
+              private var last = 0L
+              private val baos = ByteArrayOutputStream(256 * 1024)
+              private var padded: Bitmap? = null
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -207,68 +219,114 @@ jobs:
                   return START_NOT_STICKY
               }
 
-              private fun startStreaming(ip: String) {
-                  val dm = resources.displayMetrics
+              // Размер кадра по текущему положению экрана (учитывает поворот)
+              private fun computeSize(): Pair<Int, Int> {
+                  val dm = DisplayMetrics()
+                  val dmg = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                  @Suppress("DEPRECATION")
+                  dmg.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+                  dpi = dm.densityDpi
                   val scale = longSide.toFloat() / max(dm.widthPixels, dm.heightPixels)
                   val w = (dm.widthPixels * scale).toInt() / 2 * 2
                   val h = (dm.heightPixels * scale).toInt() / 2 * 2
+                  return Pair(w, h)
+              }
 
+              private fun makeReader(w: Int, h: Int): ImageReader {
+                  val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  r.setOnImageAvailableListener({ rd -> onFrame(rd, w, h) }, handler)
+                  return r
+              }
+
+              private fun onFrame(rd: ImageReader, w: Int, h: Int) {
+                  var img: android.media.Image? = null
+                  try { img = rd.acquireLatestImage() } catch (e: Exception) { }
+                  if (img == null) return
+                  try {
+                      val now = SystemClock.uptimeMillis()
+                      if (now - last < minIntervalMs) return
+                      last = now
+
+                      val plane = img.planes[0]
+                      val rowPixels = plane.rowStride / plane.pixelStride
+                      var b = padded
+                      if (b == null || b.width != rowPixels || b.height != h) {
+                          b = Bitmap.createBitmap(rowPixels, h, Bitmap.Config.ARGB_8888)
+                          padded = b
+                      }
+                      b.copyPixelsFromBuffer(plane.buffer)
+                      val cropped = Bitmap.createBitmap(b, 0, 0, w, h)
+
+                      baos.reset()
+                      cropped.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+                      val o = out ?: return
+                      o.writeInt(baos.size())
+                      baos.writeTo(o)
+                      o.flush()
+                  } catch (e: IOException) {
+                      stopSelf()
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun startStreaming(ip: String) {
                   val t = HandlerThread("capture").also { it.start() }
                   thread = t
-                  val handler = Handler(t.looper)
+                  val h = Handler(t.looper)
+                  handler = h
 
-                  handler.post {
+                  h.post {
                       try {
                           val s = Socket()
                           s.connect(InetSocketAddress(ip, 5000), 5000)
                           s.tcpNoDelay = true
                           socket = s
-                          val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 65536))
+                          out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 65536))
 
-                          val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                          val (w, hh) = computeSize()
+                          curW = w; curH = hh
+                          val r = makeReader(w, hh)
                           reader = r
-                          val bmp = Bitmap.createBitmap(w + 64, h, Bitmap.Config.ARGB_8888)
-                          val baos = ByteArrayOutputStream(256 * 1024)
-                          var last = 0L
-
-                          r.setOnImageAvailableListener({ rd ->
-                              val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
-                              try {
-                                  val now = SystemClock.uptimeMillis()
-                                  if (now - last < minIntervalMs) return@setOnImageAvailableListener
-                                  last = now
-
-                                  val plane = img.planes[0]
-                                  val rowPixels = plane.rowStride / plane.pixelStride
-                                  val b = if (rowPixels == bmp.width) bmp
-                                          else Bitmap.createBitmap(rowPixels, h, Bitmap.Config.ARGB_8888)
-                                  b.copyPixelsFromBuffer(plane.buffer)
-                                  val cropped = Bitmap.createBitmap(b, 0, 0, w, h)
-
-                                  baos.reset()
-                                  cropped.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
-                                  out.writeInt(baos.size())
-                                  baos.writeTo(out)
-                                  out.flush()
-                              } catch (e: IOException) {
-                                  stopSelf()
-                              } finally {
-                                  img.close()
-                              }
-                          }, handler)
-
                           display = projection?.createVirtualDisplay(
-                              "ps3mirror", w, h, dm.densityDpi,
+                              "ps3mirror", w, hh, dpi,
                               DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                              r.surface, null, handler
+                              r.surface, null, h
                           )
+
+                          // Следим за поворотом экрана
+                          val dmg = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                          val l = object : DisplayManager.DisplayListener {
+                              override fun onDisplayAdded(displayId: Int) {}
+                              override fun onDisplayRemoved(displayId: Int) {}
+                              override fun onDisplayChanged(displayId: Int) {
+                                  if (displayId == Display.DEFAULT_DISPLAY) resizeIfNeeded()
+                              }
+                          }
+                          listener = l
+                          dmg.registerDisplayListener(l, h)
                       } catch (e: Exception) {
                           stopSelf()
                       }
                   }
               }
 
+              private fun resizeIfNeeded() {
+                  val (w, h) = computeSize()
+                  if (w == curW && h == curH) return
+                  curW = w; curH = h
+                  val old = reader
+                  val r = makeReader(w, h)
+                  reader = r
+                  display?.resize(w, h, dpi)
+                  display?.setSurface(r.surface)
+                  try { old?.close() } catch (_: Exception) {}
+              }
+
               override fun onDestroy() {
+                  try {
+                      listener?.let { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(it) }
+                  } catch (_: Exception) {}
                   try { display?.release() } catch (_: Exception) {}
                   try { reader?.close() } catch (_: Exception) {}
                   try { socket?.close() } catch (_: Exception) {}
