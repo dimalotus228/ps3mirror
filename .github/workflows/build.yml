@@ -503,6 +503,7 @@ jobs:
           $(error "Please set PSL1GHT")
           endif
           include $(PSL1GHT)/ppu_rules
+          LD = $(CC)
 
           TARGET   := ps3mirror
           BUILD    := build
