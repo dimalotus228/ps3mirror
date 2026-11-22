@@ -650,7 +650,7 @@ jobs:
               memset(&params, 0, sizeof(params));
               params.numChannels = AUDIO_PORT_2CH;
               params.numBlocks = AUDIO_BLOCK_8;
-              params.attr = 0;
+              params.attrib = 0;
               params.level = 1.0f;
               uint32_t portNum;
               if (audioPortOpen(&params, &portNum) != 0) sysThreadExit(0);
