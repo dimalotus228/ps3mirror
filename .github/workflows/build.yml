@@ -330,13 +330,7 @@ jobs:
           #include <stdint.h>
           #include <malloc.h>
           #include <unistd.h>
-                    #if defined(__has_include)
-          #  if __has_include(<sysutil/sysutil.h>)
-          #    include <sysutil/sysutil.h>
-          #  elif __has_include(<sys/sysutil.h>)
-          #    include <sys/sysutil.h>
-          #  endif
-          #endif
+                    #include <sysutil/sysutil.h>
           #include <sysutil/video.h>
           #include <rsx/rsx.h>
           #include <net/net.h>
@@ -523,7 +517,7 @@ jobs:
 
           CFLAGS   = -O2 -Wall -mcpu=cell $(MACHDEP) $(INCLUDES)
           CXXFLAGS = $(CFLAGS)
-          LDFLAGS  = $(MACHDEP) -Wl,-Map,$(notdir $@).map
+          LDFLAGS  = $(MACHDEP) -Wl,-Map,$(notdir $@).map -L$(PSL1GHT)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib
 
           ifneq ($(BUILD),$(notdir $(CURDIR)))
           export OUTPUT   := $(CURDIR)/$(TARGET)
@@ -532,7 +526,8 @@ jobs:
           export DEPSDIR  := $(BUILDDIR)
           CFILES  := $(foreach dir,$(SOURCE),$(notdir $(wildcard $(dir)/*.c)))
           export OFILES   := $(CFILES:.c=.o)
-          export INCLUDES := $(foreach dir,$(INCLUDE),-I$(CURDIR)/$(dir)) -I$(CURDIR)/$(BUILD)
+          export INCLUDES := $(foreach dir,$(INCLUDE),-I$(CURDIR)/$(dir)) $(LIBPSL1GHT_INC) -I$(PSL1GHT)/ppu/include -I$(PS3DEV)/portlibs/ppu/include -I$(CURDIR)/$(BUILD)
+          export LIBPATHS := $(LIBPSL1GHT_LIB) -L$(PSL1GHT)/ppu/lib -L$(PS3DEV)/portlibs/ppu/lib
 
           .PHONY: $(BUILD) clean pkg
           $(BUILD):
