@@ -166,8 +166,8 @@ jobs:
 
           class StreamService : Service() {
               // Настройки качества
-              private val longSide = 960      // длинная сторона кадра, пикселей
-              private val jpegQuality = 60
+              private val longSide = 1280     // длинная сторона кадра, пикселей
+              private val jpegQuality = 75
               private val minIntervalMs = 66L // ~15 кадров/с
 
               private var projection: MediaProjection? = null
