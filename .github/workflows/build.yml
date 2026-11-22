@@ -65,6 +65,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+          <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -89,9 +90,12 @@ jobs:
           cat > 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/MainActivity.kt' << 'EOF_A5'
           package com.example.ps3mirror
 
+          import android.Manifest
           import android.app.Activity
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.media.projection.MediaProjectionManager
+          import android.os.Build
           import android.os.Bundle
           import android.widget.Button
           import android.widget.EditText
@@ -112,8 +116,14 @@ jobs:
                       text = "Начать трансляцию"
                       setOnClickListener {
                           prefs.edit().putString("ip", ipEdit.text.toString().trim()).apply()
-                          val mpm = getSystemService(MediaProjectionManager::class.java)
-                          startActivityForResult(mpm.createScreenCaptureIntent(), 1)
+                          // Для захвата звука нужно разрешение RECORD_AUDIO
+                          if (Build.VERSION.SDK_INT >= 23 &&
+                              checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+                          ) {
+                              requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+                          } else {
+                              launchCapture()
+                          }
                       }
                   }
                   val stop = Button(this).apply {
@@ -126,6 +136,17 @@ jobs:
                       addView(ipEdit); addView(start); addView(stop)
                   }
                   setContentView(layout)
+              }
+
+              private fun launchCapture() {
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 1)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  // Продолжаем в любом случае: без разрешения будет только картинка
+                  if (requestCode == 2) launchCapture()
               }
 
               @Deprecated("Deprecated in Java")
@@ -145,13 +166,19 @@ jobs:
           cat > 'ps3mirror-android/app/src/main/java/com/example/ps3mirror/StreamService.kt' << 'EOF_A6'
           package com.example.ps3mirror
 
+          import android.Manifest
           import android.app.*
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Bitmap
           import android.graphics.PixelFormat
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
           import android.media.ImageReader
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
@@ -188,6 +215,12 @@ jobs:
               private val baos = ByteArrayOutputStream(256 * 1024)
               private var padded: Bitmap? = null
 
+              // Звук
+              private var audioRecord: AudioRecord? = null
+              private var audioSocket: Socket? = null
+              private var audioThread: Thread? = null
+              @Volatile private var audioRunning = false
+
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -216,6 +249,7 @@ jobs:
                       }, null)
                   }
                   startStreaming(ip)
+                  startAudio(ip)
                   return START_NOT_STICKY
               }
 
@@ -323,7 +357,58 @@ jobs:
                   try { old?.close() } catch (_: Exception) {}
               }
 
+              // Захват звука телефона (Android 10+) и отправка на PS3, порт 5001.
+              // Если что-то не получилось, картинка продолжает работать без звука.
+              private fun startAudio(ip: String) {
+                  if (Build.VERSION.SDK_INT < 29) return
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+                  val proj = projection ?: return
+                  audioRunning = true
+                  audioThread = Thread {
+                      try {
+                          val cfg = AudioPlaybackCaptureConfiguration.Builder(proj)
+                              .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                              .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                              .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                              .build()
+                          val fmt = AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(48000)
+                              .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                              .build()
+                          val minBuf = AudioRecord.getMinBufferSize(
+                              48000, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
+                          )
+                          val rec = AudioRecord.Builder()
+                              .setAudioFormat(fmt)
+                              .setBufferSizeInBytes(max(minBuf, 16384) * 2)
+                              .setAudioPlaybackCaptureConfig(cfg)
+                              .build()
+                          audioRecord = rec
+
+                          val s = Socket()
+                          s.connect(InetSocketAddress(ip, 5001), 5000)
+                          s.tcpNoDelay = true
+                          audioSocket = s
+                          val os = s.getOutputStream()
+
+                          rec.startRecording()
+                          val buf = ByteArray(4096) // около 21 мс звука
+                          while (audioRunning) {
+                              val n = rec.read(buf, 0, buf.size)
+                              if (n > 0) os.write(buf, 0, n) else if (n < 0) break
+                          }
+                      } catch (e: Exception) {
+                          // без звука
+                      }
+                  }.also { it.start() }
+              }
+
               override fun onDestroy() {
+                  audioRunning = false
+                  try { audioRecord?.stop() } catch (_: Exception) {}
+                  try { audioRecord?.release() } catch (_: Exception) {}
+                  try { audioSocket?.close() } catch (_: Exception) {}
                   try {
                       listener?.let { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(it) }
                   } catch (_: Exception) {}
@@ -395,6 +480,8 @@ jobs:
           #include <sys/socket.h>
           #include <netinet/in.h>
           #include <arpa/inet.h>
+          #include <sys/thread.h>
+          #include <audio/audio.h>
 
           #define STB_IMAGE_IMPLEMENTATION
           #define STBI_ONLY_JPEG
@@ -496,6 +583,113 @@ jobs:
               return 1;
           }
 
+
+          #define APORT 5001
+          #define RING_FRAMES 48000
+          #define AUDIO_BLOCK_FRAMES 256
+
+          static int16_t ring[RING_FRAMES * 2];
+          static volatile uint32_t rd_pos = 0, wr_pos = 0;
+
+          static int make_listener(int port) {
+              int ls = socket(AF_INET, SOCK_STREAM, 0);
+              int one = 1;
+              setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+              struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+              setsockopt(ls, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+              struct sockaddr_in a;
+              memset(&a, 0, sizeof(a));
+              a.sin_family = AF_INET;
+              a.sin_port = htons(port);
+              a.sin_addr.s_addr = htonl(INADDR_ANY);
+              bind(ls, (struct sockaddr *)&a, sizeof(a));
+              listen(ls, 1);
+              return ls;
+          }
+
+          // Приём звука: PCM 16 бит, стерео, 48 кГц, little-endian -> кольцевой буфер
+          static void audio_net_thread(void *arg) {
+              int ls = make_listener(APORT);
+              uint8_t tmp[4096];
+              struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+              while (running) {
+                  int c = accept(ls, NULL, NULL);
+                  if (c < 0) continue;
+                  setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                  size_t have = 0; int fails = 0;
+                  while (running) {
+                      int r = recv(c, tmp + have, sizeof(tmp) - have, 0);
+                      if (r == 0) break;
+                      if (r < 0) { if (++fails > 10) break; continue; }
+                      fails = 0;
+                      have += r;
+                      size_t frames = have / 4;
+                      for (size_t f = 0; f < frames; f++) {
+                          uint32_t w = wr_pos;
+                          if (w - rd_pos >= RING_FRAMES) break;
+                          const uint8_t *p = tmp + f * 4;
+                          ring[(w % RING_FRAMES) * 2]     = (int16_t)(p[0] | (p[1] << 8));
+                          ring[(w % RING_FRAMES) * 2 + 1] = (int16_t)(p[2] | (p[3] << 8));
+                          __asm__ volatile("sync" ::: "memory");
+                          wr_pos = w + 1;
+                      }
+                      size_t used = frames * 4;
+                      have -= used;
+                      if (have) memmove(tmp, tmp + used, have);
+                  }
+                  close(c);
+              }
+              close(ls);
+              sysThreadExit(0);
+          }
+
+          // Вывод звука через аудиопорт PS3 (блоки по 256 отсчётов, float, стерео)
+          static void audio_play_thread(void *arg) {
+              if (audioInit() != 0) sysThreadExit(0);
+              audioPortParam params;
+              memset(&params, 0, sizeof(params));
+              params.numChannels = AUDIO_PORT_2CH;
+              params.numBlocks = AUDIO_BLOCK_8;
+              params.attr = 0;
+              params.level = 1.0f;
+              uint32_t portNum;
+              if (audioPortOpen(&params, &portNum) != 0) sysThreadExit(0);
+              audioPortConfig config;
+              audioGetPortConfig(portNum, &config);
+              audioPortStart(portNum);
+
+              float *base = (float *)(uintptr_t)config.audioDataStart;
+              volatile uint64_t *readIndex = (volatile uint64_t *)(uintptr_t)config.readIndex;
+              uint32_t nb = config.numBlocks;
+              uint32_t next = (uint32_t)((*readIndex + 1) % nb);
+              int primed = 0;
+
+              while (running) {
+                  uint32_t ri = (uint32_t)(*readIndex % nb);
+                  while (((next + nb - ri - 1) % nb) < nb - 2) {
+                      uint32_t avail = wr_pos - rd_pos;
+                      if (avail > 9600) { rd_pos = wr_pos - 2400; avail = 2400; }
+                      if (!primed && avail >= 2400) primed = 1;
+                      float *blk = base + (size_t)next * AUDIO_BLOCK_FRAMES * 2;
+                      for (int i = 0; i < AUDIO_BLOCK_FRAMES; i++) {
+                          if (primed && wr_pos != rd_pos) {
+                              uint32_t r = rd_pos;
+                              blk[i * 2]     = ring[(r % RING_FRAMES) * 2]     / 32768.0f;
+                              blk[i * 2 + 1] = ring[(r % RING_FRAMES) * 2 + 1] / 32768.0f;
+                              rd_pos = r + 1;
+                          } else {
+                              blk[i * 2] = 0.0f;
+                              blk[i * 2 + 1] = 0.0f;
+                              primed = 0;
+                          }
+                      }
+                      next = (next + 1) % nb;
+                  }
+                  usleep(1500);
+              }
+              sysThreadExit(0);
+          }
+
           int main(void) {
               sysUtilRegisterCallback(0, sys_cb, NULL);
               init_video();
@@ -503,6 +697,9 @@ jobs:
               flip();
 
               netInitialize();
+          sys_ppu_thread_t t_anet, t_aplay;
+          sysThreadCreate(&t_anet, audio_net_thread, NULL, 1500, 0x8000, 0, "audio_net");
+          sysThreadCreate(&t_aplay, audio_play_thread, NULL, 1000, 0x8000, 0, "audio_play");
               int ls = socket(AF_INET, SOCK_STREAM, 0);
               int one = 1;
               setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -568,7 +765,7 @@ jobs:
           SOURCE   := source
           INCLUDE  := source
           DATA     := data
-          LIBS     := -lrsx -lgcm_sys -lio -lsysutil -lrt -lnet -lsysmodule -llv2 -lm
+          LIBS     := -lrsx -lgcm_sys -lio -laudio -lsysutil -lrt -lnet -lsysmodule -llv2 -lm
 
           TITLE    := PS3 Screen Mirror
           APPID    := MIRROR001
