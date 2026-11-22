@@ -510,7 +510,7 @@ jobs:
           SOURCE   := source
           INCLUDE  := source
           DATA     := data
-          LIBS     := -lrsx -lgcm_sys -lio -lsysutil -lrt -llv2 -lnet -lm
+          LIBS     := -lrsx -lgcm_sys -lio -lsysutil -lrt -lnet -lsysmodule -llv2 -lm
 
           TITLE    := PS3 Screen Mirror
           APPID    := MIRROR001
