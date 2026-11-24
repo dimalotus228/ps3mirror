@@ -195,9 +195,9 @@ jobs:
 
           class StreamService : Service() {
               // Настройки качества
-              private val longSide = 1280     // длинная сторона кадра, пикселей
-              private val jpegQuality = 75
-              private val minIntervalMs = 66L // ~15 кадров/с
+              private val longSide = 960      // длинная сторона кадра, пикселей
+              private val jpegQuality = 65
+              private val minIntervalMs = 50L // ~20 кадров/с
 
               private var projection: MediaProjection? = null
               private var display: VirtualDisplay? = null
@@ -214,6 +214,7 @@ jobs:
               private var last = 0L
               private val baos = ByteArrayOutputStream(256 * 1024)
               private var padded: Bitmap? = null
+          @Volatile private var sending = false
 
               // Звук
               private var audioRecord: AudioRecord? = null
@@ -279,6 +280,7 @@ jobs:
                   try {
                       val now = SystemClock.uptimeMillis()
                       if (now - last < minIntervalMs) return
+                      if (sending) return   // сеть не успевает: кадр выбрасываем
                       last = now
 
                       val plane = img.planes[0]
@@ -294,9 +296,14 @@ jobs:
                       baos.reset()
                       cropped.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
                       val o = out ?: return
-                      o.writeInt(baos.size())
-                      baos.writeTo(o)
-                      o.flush()
+                      sending = true
+                      try {
+                          o.writeInt(baos.size())
+                          baos.writeTo(o)
+                          o.flush()
+                      } finally {
+                          sending = false
+                      }
                   } catch (e: IOException) {
                       stopSelf()
                   } finally {
@@ -668,7 +675,7 @@ jobs:
                   uint32_t ri = (uint32_t)(*readIndex % nb);
                   while (((next + nb - ri - 1) % nb) < nb - 2) {
                       uint32_t avail = wr_pos - rd_pos;
-                      if (avail > 9600) { rd_pos = wr_pos - 2400; avail = 2400; }
+                      if (avail > 6000) { rd_pos = wr_pos - 2400; avail = 2400; }
                       if (!primed && avail >= 2400) primed = 1;
                       float *blk = base + (size_t)next * AUDIO_BLOCK_FRAMES * 2;
                       for (int i = 0; i < AUDIO_BLOCK_FRAMES; i++) {
